@@ -20,18 +20,26 @@ struct Args {
     client_timeout: u64,
     #[arg(long, default_value_t = 1)]
     heart_beat: u64,
+    /// Suppress informational log output
+    #[arg(long, short)]
+    quiet: bool,
 }
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    let args = Args::parse();
+
+    let max_level = if args.quiet {
+        tracing::Level::ERROR
+    } else {
+        tracing::Level::INFO
+    };
     let (non_blocking, _guard) = tracing_appender::non_blocking(std::io::stdout());
     tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
+        .with_max_level(max_level)
         .with_ansi(false)
         .with_writer(non_blocking)
         .init();
-
-    let args = Args::parse();
 
     let log_path = match args.log_path {
         Some(log_path) => log_path,
