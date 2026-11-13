@@ -39,9 +39,13 @@ async fn main() -> ExitCode {
             info!("Waiting for PathOfExile client...");
 
             async {
-                let mut sys = System::new_all();
                 let mut interval = tokio::time::interval(Duration::from_secs(args.heart_beat));
                 loop {
+                    let Ok(mut sys) = System::new_all() else {
+                        error!("PathOfExile auto-detect unsupported on this system; retrying...");
+                        interval.tick().await;
+                        continue;
+                    };
                     sys.refresh_all();
 
                     for process in sys.processes_by_name("PathOfExile".as_ref()) {
