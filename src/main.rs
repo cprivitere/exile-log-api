@@ -27,8 +27,8 @@ struct Args {
     quiet: bool,
 }
 
-// 16x16 amber dot icon, RGBA, drawn once at startup.
-fn tray_icon_data() -> tray_icon::Icon {
+/// Tray dot colors. Amber = waiting, green = live, red = log unreadable.
+fn dot_icon(r: u8, g: u8, b: u8) -> tray_icon::Icon {
     const SIZE: u32 = 16;
     let mut rgba = Vec::with_capacity((SIZE * SIZE * 4) as usize);
     for y in 0..SIZE {
@@ -37,7 +37,7 @@ fn tray_icon_data() -> tray_icon::Icon {
             let dy = y as f32 - 7.5;
             let inside = dx * dx + dy * dy <= 30.0;
             if inside {
-                rgba.extend_from_slice(&[0xF5, 0xA6, 0x23, 0xFF]);
+                rgba.extend_from_slice(&[r, g, b, 0xFF]);
             } else {
                 rgba.extend_from_slice(&[0, 0, 0, 0]);
             }
@@ -46,18 +46,56 @@ fn tray_icon_data() -> tray_icon::Icon {
     tray_icon::Icon::from_rgba(rgba, SIZE, SIZE).expect("valid icon")
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrayStatus {
+    /// No client yet (or none for a while): amber.
+    Waiting,
+    /// Tab connected, log reads healthy: green.
+    Live,
+    /// Log unreadable, retrying: red (latches until a healthy read).
+    Degraded,
+}
+
+impl TrayStatus {
+    fn icon(self) -> tray_icon::Icon {
+        match self {
+            TrayStatus::Waiting => dot_icon(0xF5, 0xA6, 0x23),
+            TrayStatus::Live => dot_icon(0x3D, 0xD6, 0x6E),
+            TrayStatus::Degraded => dot_icon(0xE5, 0x4E, 0x4E),
+        }
+    }
+
+    fn tooltip(self, clients: usize) -> String {
+        match self {
+            TrayStatus::Waiting => "exile-log-api — waiting for client…".to_string(),
+            TrayStatus::Live => format!("exile-log-api — live ({clients} client{})", if clients == 1 { "" } else { "s" }),
+            TrayStatus::Degraded => "exile-log-api — log unreadable, retrying…".to_string(),
+        }
+    }
+}
+
 enum AppEvent {
     TrayMenu(muda::MenuEvent),
     ServerDone(ExitCode),
+    Status(server::StatusEvent),
 }
+
 struct App {
     proxy: winit::event_loop::EventLoopProxy<AppEvent>,
     tray: Option<tray_icon::TrayIcon>,
     quit_id: muda::MenuId,
     runtime: Option<tokio::runtime::Runtime>,
     args: Option<Args>,
+    status: TrayStatus,
+    clients: usize,
+    /// Ticks since the last connected client went away. Green latches until
+    /// this exceeds the grace period, so tab reloads don't flap amber/green.
+    idle_ticks: u32,
     exit_code: ExitCode,
 }
+
+/// Heartbeats to wait with zero clients before leaving Live (10s at 1s/tick).
+const IDLE_GRACE_TICKS: u32 = 10;
 
 impl App {
     fn new(args: Args, proxy: winit::event_loop::EventLoopProxy<AppEvent>) -> Self {
@@ -67,6 +105,9 @@ impl App {
             quit_id: muda::MenuId::new("quit-placeholder"),
             runtime: None,
             args: Some(args),
+            status: TrayStatus::Waiting,
+            clients: 0,
+            idle_ticks: 0,
             exit_code: ExitCode::SUCCESS,
         }
     }
@@ -78,11 +119,96 @@ impl App {
             .build()
             .expect("tokio runtime");
         let proxy = self.proxy.clone();
+        let (status_tx, mut status_rx) = tokio::sync::mpsc::unbounded_channel();
+        let status = server::Status::new(status_tx);
+        // Bridge async status events onto the winit event loop, which owns
+        // the tray icon. A 1s poll also drives the idle grace countdown.
         runtime.spawn(async move {
-            let code = run_server(args).await;
+            let mut tick = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                tokio::select! {
+                    ev = status_rx.recv() => {
+                        let Some(ev) = ev else { break };
+                        if proxy.send_event(AppEvent::Status(ev)).is_err() {
+                            break;
+                        }
+                    }
+                    _ = tick.tick() => {
+                        if proxy.send_event(AppEvent::Status(server::StatusEvent::Tick)).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        let proxy = self.proxy.clone();
+        runtime.spawn(async move {
+            let code = run_server(args, status).await;
             let _ = proxy.send_event(AppEvent::ServerDone(code));
         });
         self.runtime = Some(runtime);
+    }
+
+    /// Apply one status event. The icon/tooltip only change on transitions.
+    fn apply_status(&mut self, ev: server::StatusEvent) {
+        use server::StatusEvent as E;
+        match ev {
+            E::ClientConnected => {
+                self.idle_ticks = 0;
+            }
+            E::ClientDisconnected => {}
+            E::Tick => {
+                if self.clients == 0 {
+                    self.idle_ticks = self.idle_ticks.saturating_add(1);
+                }
+            }
+            E::LogFailed => {
+                self.set_status(TrayStatus::Degraded);
+                return;
+            }
+            E::LogHealthy => {
+                if self.status == TrayStatus::Degraded {
+                    self.set_status(if self.clients > 0 {
+                        TrayStatus::Live
+                    } else {
+                        TrayStatus::Waiting
+                    });
+                }
+                return;
+            }
+        }
+        if self.status == TrayStatus::Degraded {
+            return;
+        }
+        if self.clients > 0 {
+            self.idle_ticks = 0;
+            self.set_status(TrayStatus::Live);
+        } else if self.idle_ticks > IDLE_GRACE_TICKS {
+            self.set_status(TrayStatus::Waiting);
+        }
+    }
+
+    fn set_status(&mut self, next: TrayStatus) {
+        if next == self.status {
+            if next == TrayStatus::Live {
+                self.refresh_tooltip();
+            }
+            return;
+        }
+        self.status = next;
+        if next == TrayStatus::Live {
+            self.idle_ticks = 0;
+        }
+        if let Some(tray) = &self.tray {
+            let _ = tray.set_icon(Some(next.icon()));
+            let _ = tray.set_tooltip(Some(next.tooltip(self.clients)));
+        }
+    }
+
+    fn refresh_tooltip(&mut self) {
+        if let Some(tray) = &self.tray {
+            let _ = tray.set_tooltip(Some(self.status.tooltip(self.clients)));
+        }
     }
 }
 
@@ -97,8 +223,8 @@ impl winit::application::ApplicationHandler<AppEvent> for App {
         self.quit_id = quit.id().clone();
         let tray = tray_icon::TrayIconBuilder::new()
             .with_menu(Box::new(menu))
-            .with_tooltip("exile-log-api")
-            .with_icon(tray_icon_data())
+            .with_tooltip(TrayStatus::Waiting.tooltip(0))
+            .with_icon(TrayStatus::Waiting.icon())
             .build()
             .expect("tray icon");
         self.tray = Some(tray);
@@ -128,6 +254,18 @@ impl winit::application::ApplicationHandler<AppEvent> for App {
                 }
                 self.tray = None;
                 event_loop.exit();
+            }
+            AppEvent::Status(ev) => {
+                match ev {
+                    server::StatusEvent::ClientConnected => {
+                        self.clients = self.clients.saturating_add(1);
+                    }
+                    server::StatusEvent::ClientDisconnected => {
+                        self.clients = self.clients.saturating_sub(1);
+                    }
+                    _ => {}
+                }
+                self.apply_status(ev);
             }
         }
     }
@@ -175,7 +313,7 @@ fn main() -> ExitCode {
     app.exit_code
 }
 
-async fn run_server(args: Args) -> ExitCode {
+async fn run_server(args: Args, status: server::Status) -> ExitCode {
     let log_path = match args.log_path {
         Some(log_path) => log_path,
         _ => {
@@ -217,7 +355,12 @@ async fn run_server(args: Args) -> ExitCode {
 
     let (tx, rx) = tokio::sync::broadcast::channel(16);
 
-    let listen = server::listen(args.address, rx, Duration::from_secs(args.client_timeout));
+    let listen = server::listen(
+        args.address,
+        rx,
+        Duration::from_secs(args.client_timeout),
+        status.clone(),
+    );
     let log = async move {
         let patterns = RegexSet::new([r"Generating level \d+ area"]).unwrap();
         let mut reader: Option<log_reader::Reader> = None;
@@ -226,9 +369,13 @@ async fn run_server(args: Args) -> ExitCode {
             let mut messages = vec![Message::Ping(Default::default())];
             if reader.is_none() {
                 match log_reader::build(&log_path, patterns.clone()) {
-                    Ok(built) => reader = Some(built),
+                    Ok(built) => {
+                        reader = Some(built);
+                        status.send(server::StatusEvent::LogHealthy);
+                    }
                     Err(e) => {
                         error!("log read failed: {e}");
+                        status.send(server::StatusEvent::LogFailed);
                         let _ = tx.send(messages);
                         interval.tick().await;
                         continue;
@@ -239,7 +386,10 @@ async fn run_server(args: Args) -> ExitCode {
                 && let Err(e) = r.read_latest(|line| messages.push(line.into()))
             {
                 error!("log read failed: {e}");
+                status.send(server::StatusEvent::LogFailed);
                 reader = None;
+            } else {
+                status.send(server::StatusEvent::LogHealthy);
             }
             let _ = tx.send(messages);
             interval.tick().await;
