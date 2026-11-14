@@ -17,6 +17,10 @@ impl Reader {
         let file = File::open(&self.path)?;
         let new_byte_offset = file.metadata()?.len();
 
+        if new_byte_offset < self.byte_offset {
+            self.byte_offset = 0;
+        }
+
         let mut reader = BufReader::new(file);
         reader.seek(SeekFrom::Start(self.byte_offset))?;
 
@@ -44,4 +48,35 @@ pub fn build(path: impl Into<PathBuf>, patterns: RegexSet) -> Result<Reader, std
 
     reader.read_latest(|_| {})?;
     Ok(reader)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unique_path() -> PathBuf {
+        std::env::temp_dir().join(format!("exile-log-api-test-{}-{}.txt", std::process::id(), {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static N: AtomicU64 = AtomicU64::new(0);
+            N.fetch_add(1, Ordering::Relaxed)
+        }))
+    }
+
+    #[test]
+    fn truncate_resets_offset() {
+        let path = unique_path();
+        std::fs::write(&path, "2026/01/01 Generating level 1 area \"x\" with seed 1\n2026/01/01 unrelated client startup noise\n").unwrap();
+        let patterns = RegexSet::new([r"Generating level \d+ area"]).unwrap();
+        let mut reader = build(&path, patterns).unwrap();
+        let mut got: Vec<String> = Vec::new();
+        reader.read_latest(|line| got.push(line.to_string())).unwrap();
+        assert!(got.is_empty(), "drained lines must not resend: {got:?}");
+        std::fs::write(&path, "2026/01/01 Generating level 2 area \"y\" with seed 2\n").unwrap();
+        reader.read_latest(|line| got.push(line.to_string())).unwrap();
+        assert!(
+            got.iter().any(|line| line.contains("area \"y\"")),
+            "truncated log must deliver new lines: {got:?}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
 }

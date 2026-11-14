@@ -4,7 +4,7 @@ use anyhow::Context;
 use futures_util::{SinkExt, StreamExt};
 use tokio::{
     net::{TcpListener, TcpStream},
-    sync::broadcast::Receiver,
+    sync::broadcast::{Receiver, error::RecvError},
 };
 use tokio_tungstenite::tungstenite::{self, Message};
 use tracing::info;
@@ -60,13 +60,18 @@ async fn accept_connection(
 
     let write_handle = async {
         loop {
-            let message_batch = rx.recv().await?;
-            for message in message_batch {
-                write.feed(message).await?;
+            match rx.recv().await {
+                Ok(message_batch) => {
+                    for message in message_batch {
+                        write.feed(message).await?;
+                    }
+                    write.flush().await?;
+                }
+                Err(RecvError::Lagged(_)) => continue,
+                Err(RecvError::Closed) => break,
             }
-
-            write.flush().await?;
         }
+        Ok::<(), anyhow::Error>(())
     };
 
     let res: anyhow::Result<()> = tokio::select! {

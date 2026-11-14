@@ -198,6 +198,12 @@ async fn run_server(args: Args) -> ExitCode {
                                 return log_path;
                             }
                         }
+                        if let Some(dir) = process.exe().and_then(|p| p.parent()) {
+                            let log_path = dir.join("logs").join("LatestClient.txt");
+                            if let Ok(true) = log_path.try_exists() {
+                                return log_path;
+                            }
+                        }
                     }
 
                     interval.tick().await;
@@ -209,19 +215,32 @@ async fn run_server(args: Args) -> ExitCode {
 
     info!("Log file: {}", log_path.display());
 
-    let (tx, rx) = tokio::sync::broadcast::channel(1);
+    let (tx, rx) = tokio::sync::broadcast::channel(16);
 
     let listen = server::listen(args.address, rx, Duration::from_secs(args.client_timeout));
     let log = async move {
-        let mut reader = log_reader::build(
-            log_path,
-            RegexSet::new([r"Generating level \d+ area"]).unwrap(),
-        )?;
-
+        let patterns = RegexSet::new([r"Generating level \d+ area"]).unwrap();
+        let mut reader: Option<log_reader::Reader> = None;
         let mut interval = tokio::time::interval(Duration::from_secs(args.heart_beat));
         loop {
             let mut messages = vec![Message::Ping(Default::default())];
-            reader.read_latest(|line| messages.push(line.into()))?;
+            if reader.is_none() {
+                match log_reader::build(&log_path, patterns.clone()) {
+                    Ok(built) => reader = Some(built),
+                    Err(e) => {
+                        error!("log read failed: {e}");
+                        let _ = tx.send(messages);
+                        interval.tick().await;
+                        continue;
+                    }
+                }
+            }
+            if let Some(r) = reader.as_mut()
+                && let Err(e) = r.read_latest(|line| messages.push(line.into()))
+            {
+                error!("log read failed: {e}");
+                reader = None;
+            }
             let _ = tx.send(messages);
             interval.tick().await;
         }
